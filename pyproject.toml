@@ -1,0 +1,52 @@
+[project]
+name = "spydus-cli"
+version = "0.1.0"
+description = "Automate common Spydus library account tasks"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Stanley", email = "" }
+]
+dependencies = [
+    "beautifulsoup4>=4.12.3",
+    "cryptography>=44.0.0",
+    "poethepoet>=0.32.1",
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
+    "python-dotenv>=1.0.1",
+    "requests>=2.32.3",
+    "ruff>=0.9.3",
+]
+
+[project.scripts]
+spydus-cli = "spydus_cli.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.poe.tasks]
+fix = "ruff check --fix ."
+fmt = "ruff format ."
+lint = "ruff check ."
+test = "pytest --cov=spydus_cli --cov-report=term-missing"
+check = ["fix", "fmt", "test"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -q --cov=spydus_cli --cov-report=term-missing"
+testpaths = [
+    "tests",
+]
+pythonpath = ["src"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+reportMissingImports = false
