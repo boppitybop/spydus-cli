@@ -86,16 +86,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--place-hold-item",
-        help="Search the catalogue for candidate items before placing a hold",
+        help="Alias for --catalogue-query when placing a hold (kept for backward compat)",
     )
     parser.add_argument(
         "--place-hold-item-index",
         type=int,
-        help="1-based index of catalogue result to reserve when using --place-hold-item",
+        metavar="N",
+        help=(
+            "Reserve the Nth catalogue result. "
+            "Use with --catalogue-query (or --place-hold-item) to search and reserve in one step."
+        ),
     )
     parser.add_argument(
         "--pickup-branch",
-        help="Optional pickup branch code/name when submitting a reservation",
+        help="Pickup branch name when submitting a reservation",
     )
 
     parser.add_argument(
@@ -132,8 +136,13 @@ def main() -> None:
         parser.error("--catalogue-limit must be >= 1")
     if args.place_hold_item_index is not None and args.place_hold_item_index < 1:
         parser.error("--place-hold-item-index must be >= 1")
-    if args.place_hold_item_index is not None and not args.place_hold_item:
-        parser.error("--place-hold-item-index requires --place-hold-item")
+
+    # --place-hold-item is an alias: merge into catalogue_query
+    if args.place_hold_item and not args.catalogue_query:
+        args.catalogue_query = args.place_hold_item
+
+    if args.place_hold_item_index is not None and not args.catalogue_query:
+        parser.error("--place-hold-item-index requires --catalogue-query (or --place-hold-item)")
 
     json_mode = args.output == "json"
     requested_catalogue_types = [
@@ -186,7 +195,7 @@ def main() -> None:
             args.renew_confirm,
             args.check_account,
             bool(args.place_hold_url),
-            bool(args.place_hold_item),
+            args.place_hold_item_index is not None,
         ]
     )
 
@@ -322,10 +331,12 @@ def main() -> None:
                 print("\n--- History ---")
                 print(format_records_table(account_data["history"], ["#", "date", "title", "action"]))
 
+    # ── Catalogue search (shared by display and hold) ──
+    catalogue_items: list[dict[str, Any]] = []
     if args.catalogue_query:
         catalogue_items = client.query_catalogue(
             args.catalogue_query,
-            limit=args.catalogue_limit,
+            limit=max(args.catalogue_limit, 10),
             item_types=requested_catalogue_types,
         )
         payload["data"]["catalogue"] = {
@@ -358,7 +369,8 @@ def main() -> None:
                     )
                 )
 
-    if args.place_hold_url or args.place_hold_item:
+    # ── Hold / reservation ──
+    if args.place_hold_url or (args.catalogue_query and args.place_hold_item_index is not None):
         hold_result: dict[str, Any] = {
             "success": False,
             "reason": "No hold action attempted",
@@ -370,70 +382,40 @@ def main() -> None:
                 hold_url=args.place_hold_url,
                 pickup_branch=args.pickup_branch or "",
             )
-        elif args.place_hold_item:
-            candidates = client.query_catalogue(
-                args.place_hold_item,
-                limit=max(args.catalogue_limit, 10),
-                item_types=requested_catalogue_types,
-            )
-            if not candidates:
+        elif not catalogue_items:
+            hold_result = {
+                "success": False,
+                "reason": "No catalogue match found",
+                "hold_url": "",
+            }
+        else:
+            selected_index = args.place_hold_item_index - 1
+            if selected_index < 0 or selected_index >= len(catalogue_items):
                 hold_result = {
                     "success": False,
-                    "reason": "No catalogue match found",
+                    "reason": (
+                        f"Invalid --place-hold-item-index {args.place_hold_item_index}; "
+                        f"expected 1..{len(catalogue_items)}"
+                    ),
                     "hold_url": "",
-                }
-            elif args.place_hold_item_index is None:
-                hold_result = {
-                    "success": False,
-                    "reason": "Selection required: choose a result with --place-hold-item-index",
-                    "hold_url": "",
-                    "selection_required": True,
-                    "candidates": candidates,
                 }
             else:
-                selected_index = args.place_hold_item_index - 1
-                if selected_index < 0 or selected_index >= len(candidates):
-                    hold_result = {
-                        "success": False,
-                        "reason": (
-                            f"Invalid --place-hold-item-index {args.place_hold_item_index}; "
-                            f"expected 1..{len(candidates)}"
-                        ),
-                        "hold_url": "",
-                    }
-                else:
-                    selected_item = candidates[selected_index]
-                    hold_result = client.place_hold(
-                        hold_url=selected_item.get("hold_url", ""),
-                        item_url=selected_item.get("url", ""),
-                        pickup_branch=args.pickup_branch or "",
-                    )
-                    hold_result["selected_item"] = {
-                        "index": args.place_hold_item_index,
-                        "title": selected_item.get("title", ""),
-                        "url": selected_item.get("url", ""),
-                    }
+                selected_item = catalogue_items[selected_index]
+                hold_result = client.place_hold(
+                    hold_url=selected_item.get("hold_url", ""),
+                    item_url=selected_item.get("url", ""),
+                    pickup_branch=args.pickup_branch or "",
+                )
+                hold_result["selected_item"] = {
+                    "index": args.place_hold_item_index,
+                    "title": selected_item.get("title", ""),
+                    "url": selected_item.get("url", ""),
+                }
 
         payload["data"]["hold"] = hold_result
         if not json_mode:
             print("\n--- Hold Request ---")
-            if hold_result.get("selection_required"):
-                candidate_rows = []
-                for idx, item in enumerate(hold_result.get("candidates", []), start=1):
-                    candidate_rows.append(
-                        {
-                            "#": idx,
-                            "title": item.get("title", ""),
-                            "details": item.get("details", ""),
-                            "formats": ",".join(item.get("formats", [])),
-                            "hold_url": item.get("hold_url", ""),
-                        }
-                    )
-                print(format_records_table(candidate_rows, ["#", "title", "details", "formats", "hold_url"]))
-                print(
-                    "Select a result with --place-hold-item-index N to submit the reservation."
-                )
-            elif hold_result.get("success"):
+            if hold_result.get("success"):
                 print("Hold request submitted successfully.")
                 if hold_result.get("verified") is True:
                     print("Verified: reservation confirmed in your account.")

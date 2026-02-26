@@ -113,14 +113,14 @@ uv run spydus-cli --library act --catalogue-query "Atomic Habits" --catalogue-li
 # Place hold with direct hold URL
 uv run spydus-cli --place-hold-url "https://.../RSVC..."
 
-# Start reservation flow (lists matching candidates)
-uv run spydus-cli --place-hold-item "Atomic Habits"
+# Search catalogue — results are numbered
+uv run spydus-cli --catalogue-query "Atomic Habits"
 
-# Submit reservation for selected candidate index
-uv run spydus-cli --place-hold-item "Atomic Habits" --place-hold-item-index 2
+# Reserve result #2 from the search (searches + reserves in one step)
+uv run spydus-cli --catalogue-query "Atomic Habits" --place-hold-item-index 2
 
-# Submit reservation with optional pickup branch
-uv run spydus-cli --place-hold-item "Atomic Habits" --place-hold-item-index 2 --pickup-branch "Belconnen"
+# Reserve with a pickup branch
+uv run spydus-cli --catalogue-query "Atomic Habits" --place-hold-item-index 2 --pickup-branch "Belconnen"
 
 # Strict machine-readable output
 uv run spydus-cli --check-loans --check-account --output json

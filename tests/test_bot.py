@@ -444,7 +444,9 @@ def test_main_place_hold_item_requires_selection():
                 main()
 
         output = captured_stdout.getvalue()
-        assert "selection_required" in output
+        # --place-hold-item without --place-hold-item-index now just shows catalogue results
+        assert "catalogue" in output
+        assert "Book A" in output
         instance.place_hold.assert_not_called()
 
 
