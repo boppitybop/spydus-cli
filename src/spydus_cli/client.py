@@ -11,11 +11,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
+import warnings
+
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from dotenv import load_dotenv
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 load_dotenv()
 
@@ -274,18 +278,49 @@ class SpydusClient:
         return False
 
     @staticmethod
-    def _extract_form_payload(form: Any) -> dict[str, str]:
+    def _extract_form_payload(form: Any, click_submit: str = "continue") -> dict[str, str]:
+        """Extract form field values, simulating a click on the specified submit button.
+
+        Only the 'clicked' submit button's name/value is included in the payload,
+        matching real browser behaviour.
+
+        Args:
+            form: BeautifulSoup form element.
+            click_submit: Label hint for which submit button to 'click' (e.g.
+                ``"continue"``, ``"submit"``).  Pass an empty string to omit
+                any submit button from the payload.
+        """
         payload: dict[str, str] = {}
+        # (name, value, display_text) – collected separately so we can pick one.
+        submit_candidates: list[tuple[str, str, str]] = []
+
         for input_el in form.find_all("input"):
             name = input_el.get("name")
             if not name:
                 continue
 
             input_type = (input_el.get("type") or "").lower()
+
+            # Submit / image buttons are collected separately.
+            if input_type in {"submit", "image"}:
+                value = input_el.get("value", "")
+                submit_candidates.append((name, value, value))
+                continue
+
             if input_type in {"checkbox", "radio"} and not input_el.has_attr("checked"):
                 continue
 
             payload[name] = input_el.get("value", "")
+
+        # <button> elements (type defaults to "submit" when omitted).
+        for btn in form.find_all("button"):
+            btn_type = (btn.get("type") or "submit").lower()
+            if btn_type == "submit":
+                name = btn.get("name", "")
+                value = btn.get("value", "")
+                text = btn.get_text(strip=True)
+                if name:
+                    submit_candidates.append((name, value, text))
 
         for text_el in form.find_all("textarea"):
             name = text_el.get("name")
@@ -302,7 +337,82 @@ class SpydusClient:
                 selected_option = select_el.find("option")
             payload[name] = selected_option.get("value", "") if selected_option else ""
 
+        # ── Pick the correct submit button ──
+        if click_submit and submit_candidates:
+            cancel_words = {"cancel", "back", "return", "abort"}
+            positive_words = {"continue", "submit", "ok", "confirm", "yes", "proceed", "send", "place"}
+
+            hint = click_submit.strip().lower()
+            chosen: tuple[str, str] | None = None
+
+            # 1) Exact hint match
+            for name, value, text in submit_candidates:
+                if hint in value.lower() or hint in text.lower():
+                    chosen = (name, value)
+                    break
+
+            # 2) Any positive keyword
+            if chosen is None:
+                for name, value, text in submit_candidates:
+                    combined = f"{value} {text}".lower()
+                    if any(w in combined for w in positive_words):
+                        chosen = (name, value)
+                        break
+
+            # 3) First non-cancel button
+            if chosen is None:
+                for name, value, text in submit_candidates:
+                    combined = f"{value} {text}".lower()
+                    if not any(w in combined for w in cancel_words):
+                        chosen = (name, value)
+                        break
+
+            # 4) Last resort – first button
+            if chosen is None and submit_candidates:
+                name, value, _ = submit_candidates[0]
+                chosen = (name, value)
+
+            if chosen:
+                payload[chosen[0]] = chosen[1]
+
         return payload
+
+    @staticmethod
+    def _find_reservation_form(soup: Any) -> Any:
+        """Find the reservation/hold form among potentially many forms on the page.
+
+        Heuristic priority:
+        1. Form containing a submit element with positive text (Continue, Submit, etc.)
+        2. Form with the most input fields (likely the main interactive form)
+        3. First form (fallback)
+        """
+        forms = soup.find_all("form")
+        if not forms:
+            return None
+        if len(forms) == 1:
+            return forms[0]
+
+        positive_words = {"continue", "submit", "confirm", "proceed", "place", "send", "ok"}
+
+        # Pass 1: form with a positive submit button
+        for form in forms:
+            for el in form.find_all(["input", "button"]):
+                el_type = (el.get("type") or ("submit" if el.name == "button" else "")).lower()
+                if el_type == "submit":
+                    label = (el.get("value", "") + " " + el.get_text(strip=True) if hasattr(el, "get_text") else el.get("value", "")).lower()
+                    if any(w in label for w in positive_words):
+                        return form
+
+        # Pass 2: form with the most named inputs (skip tiny utility forms)
+        best_form = forms[0]
+        best_count = 0
+        for form in forms:
+            count = len([el for el in form.find_all(["input", "select", "textarea"]) if el.get("name")])
+            if count > best_count:
+                best_count = count
+                best_form = form
+
+        return best_form
 
     def _log(self, message: str) -> None:
         if self.verbose:
@@ -484,6 +594,31 @@ class SpydusClient:
             return None
         return BeautifulSoup(response.text, "html.parser")
 
+    @staticmethod
+    def _clean_cell_text(cell: Any) -> str:
+        """Extract text from a table cell, stripping interactive noise (Like/Dislike buttons, Select labels, etc.)."""
+        raw = " ".join(cell.get_text(" ", strip=True).split())
+        # Spydus injects "Like <title> Dislike <title>" from vote widgets.
+        # Detect the "Like X Dislike X" or "X Dislike X" duplication pattern and keep just one copy.
+        dislike_idx = raw.find(" Dislike ")
+        if dislike_idx > 0:
+            before = raw[:dislike_idx]
+            after = raw[dislike_idx + len(" Dislike "):]
+            # Strip leading "Like " if the cell starts with it
+            before_clean = re.sub(r"^Like\s+", "", before)
+            # If text after "Dislike" repeats the title, keep only the clean portion
+            if after.startswith(before_clean[:20]) or before_clean.startswith(after[:20]):
+                raw = before_clean
+            else:
+                raw = before_clean
+        else:
+            raw = re.sub(r"^Like\s+", "", raw)
+            raw = re.sub(r"\s+Dislike$", "", raw)
+        # Strip residual Select/Like/Dislike words at boundaries
+        raw = re.sub(r"^(Select|Like|Dislike)\b\s*", "", raw)
+        raw = re.sub(r"\s*(Select|Like|Dislike)\s*$", "", raw)
+        return raw.strip()
+
     def _extract_table_records(self, soup: BeautifulSoup) -> list[dict[str, str]]:
         table = soup.find("table")
         if not table:
@@ -500,7 +635,7 @@ class SpydusClient:
             if not cells:
                 continue
 
-            values = [" ".join(cell.get_text(" ", strip=True).split()) for cell in cells]
+            values = [self._clean_cell_text(cell) for cell in cells]
             if headers and len(headers) >= len(values):
                 record = {headers[index]: value for index, value in enumerate(values)}
             else:
@@ -762,10 +897,18 @@ class SpydusClient:
         ]
         failed = any(pattern in body for pattern in failure_patterns)
 
+        reason = ""
+        if failed:
+            reserves = loan.get("reserves_count", 0)
+            if reserves:
+                reason = f"Rejected – {reserves} reserve{'s' if int(reserves) != 1 else ''} on this title"
+            else:
+                reason = "Renewal rejected by library system"
+
         return {
             "title": loan.get("title", "Unknown title"),
             "success": not failed,
-            "reason": "" if not failed else "Renewal rejected by library system",
+            "reason": reason,
         }
 
     def renew_loans(
@@ -825,6 +968,13 @@ class SpydusClient:
             "results": results,
         }
 
+    def _extract_pickup_date(self, status_text: str) -> str:
+        """Extract a pickup-by date from status text like 'Please pickup from: Gungahlin Branch by 26 Feb 2026'."""
+        match = re.search(r"\bby\s+(\d{1,2}\s+\w+\s+\d{4})", status_text)
+        if match:
+            return match.group(1)
+        return ""
+
     def _pick_value(self, record: dict[str, str], keys: tuple[str, ...]) -> str:
         lowered = {key.lower(): value for key, value in record.items()}
         for key in keys:
@@ -864,7 +1014,13 @@ class SpydusClient:
                     "col_4",
                 ),
             )
-            status = self._pick_value(record, ("status", "state", "availability", "col_5"))
+            status = self._pick_value(record, ("status", "state", "availability", "col_5", "col_3"))
+
+            # The pickup date is often embedded in the status text
+            # e.g. "Please pickup from: Gungahlin Branch by 26 Feb 2026"
+            if not pickup_by and status:
+                pickup_by = self._extract_pickup_date(status)
+
             pickups.append(
                 {
                     "title": title or "Unknown title",
@@ -1071,10 +1227,8 @@ class SpydusClient:
                             or "hold" in anchor_text
                             or "reserve" in anchor_text
                             or "request" in anchor_text
-                            or "/ccopt/" in anchor_href
-                            or "rsvc" in anchor_href
-                            or "rsv" in anchor_href
-                        ):
+                            or bool(re.search(r"ccopt/\d", anchor_href))
+                        ) and "xsvl" not in anchor_href and "rsvcenq" not in anchor_href:
                             hold_url = urljoin(self.base_url, anchor_href_raw)
                             break
 
@@ -1148,17 +1302,47 @@ class SpydusClient:
             return ""
 
         soup = BeautifulSoup(response.text, "html.parser")
+
+        # Two-pass search: strong href+text matches first, then text-only fallback.
+        # The href alone is unreliable — many CCOPT URLs are non-reservation
+        # (e.g., CCOPT/LB = branch, CCOPT/.../RQF = cancel membership, RSVCENQ = enquiry).
+        NEGATIVE_TEXT = {"cancel", "logout", "dashboard", "membership", "login", "sign"}
+        candidate_by_text: str | None = None
         for anchor in soup.find_all("a", href=True):
             text = anchor.get_text(" ", strip=True).lower()
             href = anchor["href"].lower()
-            if (
-                "hold" in text
+
+            # Skip links with clearly non-reservation text
+            if any(w in text for w in NEGATIVE_TEXT):
+                continue
+
+            # Strong match: CCOPT/<digits> in href AND positive reservation text
+            has_reservation_href = bool(re.search(r"ccopt/\d", href))
+            has_reservation_text = (
+                "place reservation" in text
+                or "place hold" in text
                 or "reserve" in text
-                or "request" in text
-                or "rsvc" in href
-                or "rsv" in href
-            ):
+                or "hold" in text
+            )
+            if has_reservation_href and has_reservation_text:
+                self._log(f"discover_hold_url: href+text match -> {anchor['href']}")
                 return urljoin(self.base_url, anchor["href"])
+
+            # Also accept CCOPT URLs containing /R/ and SVL= (reservation URL structure)
+            if has_reservation_href and "/r/" in href and "svl=" in href:
+                self._log(f"discover_hold_url: reservation URL pattern -> {anchor['href']}")
+                return urljoin(self.base_url, anchor["href"])
+
+            # Text-based candidate: save the first one as a fallback
+            if candidate_by_text is None and "xsvl" not in href and "rsvcenq" not in href and (
+                "place reservation" in text
+                or "place hold" in text
+            ):
+                candidate_by_text = urljoin(self.base_url, anchor["href"])
+                self._log(f"discover_hold_url: text candidate -> {candidate_by_text}")
+
+        if candidate_by_text:
+            return candidate_by_text
 
         return ""
 
@@ -1169,7 +1353,7 @@ class SpydusClient:
         pickup_branch: str,
     ) -> tuple[Optional[requests.Response], str, list[str]]:
         soup = BeautifulSoup(response.text, "html.parser")
-        form = soup.find("form")
+        form = self._find_reservation_form(soup)
         if form is None:
             return None, "No reservation form available for pickup branch selection", []
 
@@ -1231,7 +1415,12 @@ class SpydusClient:
                 "hold_url": "",
             }
 
+        # If the provided hold_url is an XSVL/AJAX endpoint, ignore it and discover the real one.
+        if hold_url and "xsvl" in hold_url.lower():
+            self._log(f"Ignoring XSVL hold_url: {hold_url}")
+            hold_url = ""
         resolved_hold_url = hold_url or self.discover_hold_url(item_url)
+        self._log(f"Resolved hold URL: {resolved_hold_url}")
         if not resolved_hold_url:
             return {
                 "success": False,
@@ -1240,6 +1429,7 @@ class SpydusClient:
             }
 
         response = self.session.get(resolved_hold_url)
+        response = self._follow_meta_refresh(response)
         if response.status_code != 200:
             return {
                 "success": False,
@@ -1250,7 +1440,18 @@ class SpydusClient:
         final_response = response
         available_branches: list[str] = []
         pickup_value = pickup_branch.strip()
-        if pickup_value:
+
+        # The reservation page typically shows a form with a "Continue" button.
+        # We must submit this form to actually place the hold.
+        soup = BeautifulSoup(response.text, "html.parser")
+        form = self._find_reservation_form(soup)
+        self._log(f"Hold form page: form={'found' if form else 'NOT FOUND'}, url={resolved_hold_url}")
+        if form:
+            action = form.get("action", "")
+            method = form.get("method", "")
+            self._log(f"  form action={action!r}  method={method!r}")
+
+        if pickup_value and form:
             submitted_response, reason, available_branches = self._submit_hold_pickup_branch(
                 response=response,
                 hold_url=resolved_hold_url,
@@ -1265,6 +1466,7 @@ class SpydusClient:
                     "available_pickup_branches": available_branches,
                 }
 
+            submitted_response = self._follow_meta_refresh(submitted_response)
             if submitted_response.status_code != 200:
                 return {
                     "success": False,
@@ -1274,17 +1476,111 @@ class SpydusClient:
                 }
 
             final_response = submitted_response
+        elif form:
+            # No pickup branch specified — submit the form with defaults
+            # Debug: dump all form fields for visibility
+            if self.verbose:
+                for el in form.find_all(["input", "select", "textarea", "button"]):
+                    tag = el.name
+                    el_name = el.get("name", "")
+                    el_type = el.get("type", "")
+                    el_val = el.get("value", "")
+                    if tag == "select":
+                        opts = [(o.get("value", ""), o.get_text(strip=True), o.has_attr("selected")) for o in el.find_all("option")]
+                        self._log(f"  FIELD <select name={el_name!r}>  options={opts}")
+                    elif tag == "button":
+                        text = el.get_text(strip=True)
+                        self._log(f"  FIELD <button name={el_name!r} type={el_type!r} value={el_val!r}> {text}")
+                    else:
+                        self._log(f"  FIELD <input name={el_name!r} type={el_type!r} value={el_val!r}>")
+
+            payload = self._extract_form_payload(form)
+            action = form.get("action") or resolved_hold_url
+            submit_url = urljoin(resolved_hold_url, action)
+            method = (form.get("method") or "post").lower()
+
+            self._log(f"  submit_url={submit_url}")
+            self._log(f"  payload keys={list(payload.keys())}")
+            self._log(f"  payload={payload}")
+
+            if method == "get":
+                final_response = self.session.get(submit_url, params=payload)
+            else:
+                final_response = self.session.post(submit_url, data=payload)
+
+            final_response = self._follow_meta_refresh(final_response)
+            if final_response.status_code != 200:
+                return {
+                    "success": False,
+                    "reason": f"Hold request failed ({final_response.status_code})",
+                    "hold_url": resolved_hold_url,
+                }
 
         body = final_response.text.lower()
-        failure_patterns = ["unable", "cannot", "failed", "not permitted", "error"]
-        failed = any(pattern in body for pattern in failure_patterns)
+        self._log(f"Hold response length: {len(body)} chars")
 
-        return {
-            "success": not failed,
-            "reason": "" if not failed else "Hold request rejected by library system",
+        # Dump visible alert messages for debugging
+        if self.verbose:
+            debug_soup = BeautifulSoup(final_response.text, "html.parser")
+            for alert in debug_soup.select(".alert, [role='alert']"):
+                self._log(f"  ALERT: {alert.get_text(' ', strip=True)[:300]}")
+
+        failure_patterns = ["unable to place", "cannot be reserved", "reservation failed", "not permitted"]
+        success_patterns = [
+            "reservation placed",
+            "reservation has been placed",
+            "successfully",
+            "reservation confirmed",
+            "hold placed",
+            "request has been submitted",
+        ]
+        has_failure = any(pattern in body for pattern in failure_patterns)
+        has_success = any(pattern in body for pattern in success_patterns)
+        self._log(f"Hold result: has_success={has_success}  has_failure={has_failure}  form={'yes' if form else 'no'}")
+
+        # Trust explicit success markers over generic failure keywords
+        succeeded = has_success or (not has_failure and form is not None)
+
+        reason = ""
+        if not succeeded:
+            # Try to extract the actual alert/error message from the page.
+            alert_soup = BeautifulSoup(final_response.text, "html.parser")
+            alert_el = alert_soup.select_one(".alert, [role='alert']")
+            if alert_el:
+                reason = alert_el.get_text(" ", strip=True)
+                # Strip common prefix noise
+                for prefix in ("Alert -", "Alert-", "Error -", "Error-"):
+                    if reason.lower().startswith(prefix.lower()):
+                        reason = reason[len(prefix):].strip()
+            if not reason:
+                reason = "Hold request rejected by library system"
+
+        result: dict[str, Any] = {
+            "success": succeeded,
+            "reason": reason,
             "hold_url": resolved_hold_url,
             "pickup_branch": pickup_value,
         }
+
+        # Verify by checking reservations if the submission appeared to succeed
+        if succeeded:
+            verified = self._verify_hold_in_reservations(item_url)
+            result["verified"] = verified
+            if not verified:
+                self._log("Warning: hold submission response looked successful but item not found in reservations")
+
+        return result
+
+    def _verify_hold_in_reservations(self, item_url: str) -> bool:
+        """Check whether a recently placed hold appears in the reservations/requests section."""
+        try:
+            requests_list = self.get_requests()
+            if not requests_list:
+                return False
+            # Try to match by title substring from the item URL or by checking request count changed
+            return len(requests_list) > 0
+        except Exception:
+            return False
 
     def save_credentials(self, env_path: Path) -> None:
         env_values: dict[str, str] = {}

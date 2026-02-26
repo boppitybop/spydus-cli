@@ -143,7 +143,7 @@ def main() -> None:
         base_url=args.base_url,
         username=args.user,
         password=args.password,
-        verbose=args.verbose or not json_mode,
+        verbose=args.verbose,
     )
 
     env_path = Path(".env")
@@ -275,13 +275,15 @@ def main() -> None:
                 f"Failed: {renewal_result['failed']} | "
                 f"Skipped: {renewal_result['skipped']}"
             )
-            failed_items = [
-                item for item in renewal_result["results"] if not item.get("success", False)
-            ]
-            if failed_items:
-                print("Issues:")
-                for item in failed_items:
-                    print(f"- {item.get('title')}: {item.get('reason', 'Unknown issue')}")
+            result_rows = []
+            for item in renewal_result["results"]:
+                result_rows.append({
+                    "title": item.get("title", "Unknown"),
+                    "result": "Renewed" if item.get("success") else "Failed",
+                    "reason": item.get("reason", ""),
+                })
+            if result_rows:
+                print(format_records_table(result_rows, ["title", "result", "reason"]))
 
     if args.check_account:
         sections = [
@@ -429,6 +431,10 @@ def main() -> None:
                 )
             elif hold_result.get("success"):
                 print("Hold request submitted successfully.")
+                if hold_result.get("verified") is True:
+                    print("Verified: reservation confirmed in your account.")
+                elif hold_result.get("verified") is False:
+                    print("Warning: could not verify reservation in your account. Check manually.")
             else:
                 print(f"Hold request failed: {hold_result.get('reason', 'Unknown issue')}")
 
