@@ -12,13 +12,14 @@ from .output import format_records_table
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Spydus CLI")
     parser.add_argument(
+        "-l",
         "--library",
         default=None,
         help="Library profile key (e.g. act, city, uni) for SPYDUS_<PROFILE>_* env vars",
     )
-    parser.add_argument("--base-url", help="Spydus base URL", default=None)
-    parser.add_argument("--user", help="Library username/card number")
-    parser.add_argument("--password", help="Library password")
+    parser.add_argument("-b", "--base-url", help="Spydus base URL", default=None)
+    parser.add_argument("-u", "--user", help="Library username/card number")
+    parser.add_argument("-p", "--password", help="Library password")
 
     parser.add_argument(
         "--setup-creds",
@@ -39,10 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not save prompted credentials",
     )
 
-    parser.add_argument("--check-new", action="store_true", help="Check for new items")
-    parser.add_argument("--check-loans", action="store_true", help="Check current loans")
+    parser.add_argument("-n", "--check-new", action="store_true", help="Check for new items")
+    parser.add_argument("-L", "--check-loans", action="store_true", help="Check current loans")
     parser.add_argument(
-        "--renew-all",
+        "-R", "--renew-all",
         action="store_true",
         help="Renew all overdue renewable loans automatically (default-safe mode)",
     )
@@ -60,17 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--renew-confirm", action="store_true", help="Prompt before renewing each loan"
     )
 
-    parser.add_argument("--check-account", action="store_true", help="Check account sections")
+    parser.add_argument("-a", "--check-account", action="store_true", help="Check account sections")
     parser.add_argument(
         "--account-sections",
         default="pickups,reservations,requests,history",
         help="Comma-separated sections: pickups,reservations,requests,history",
     )
 
-    parser.add_argument("--catalogue-query", help="Search query for catalogue")
+    parser.add_argument("-q", "--catalogue-query", help="Search query for catalogue")
     parser.add_argument("--catalogue-limit", type=int, default=10, help="Catalogue result limit")
     _CATALOGUE_TYPES = ["book", "ebook", "audiobook", "eaudiobook", "dvd", "music-cd"]
     parser.add_argument(
+        "-t",
         "--catalogue-type",
         default="",
         metavar="TYPE",
@@ -85,16 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Place a hold using a direct Spydus hold/request URL",
     )
     parser.add_argument(
-        "--place-hold-item",
-        help="Alias for --catalogue-query when placing a hold (kept for backward compat)",
-    )
-    parser.add_argument(
+        "-i",
         "--place-hold-item-index",
         type=int,
         metavar="N",
         help=(
             "Reserve the Nth catalogue result. "
-            "Use with --catalogue-query (or --place-hold-item) to search and reserve in one step."
+            "Use with --catalogue-query to search and reserve in one step."
         ),
     )
     parser.add_argument(
@@ -110,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--loans-limit", type=int, default=10, help="Number of loans for top mode")
     parser.add_argument(
+        "-o",
         "--output",
         choices=["table", "compact", "json"],
         default="table",
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Color mode for compact output",
     )
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose logs")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logs")
 
     return parser
 
@@ -137,12 +137,8 @@ def main() -> None:
     if args.place_hold_item_index is not None and args.place_hold_item_index < 1:
         parser.error("--place-hold-item-index must be >= 1")
 
-    # --place-hold-item is an alias: merge into catalogue_query
-    if args.place_hold_item and not args.catalogue_query:
-        args.catalogue_query = args.place_hold_item
-
     if args.place_hold_item_index is not None and not args.catalogue_query:
-        parser.error("--place-hold-item-index requires --catalogue-query (or --place-hold-item)")
+        parser.error("--place-hold-item-index requires --catalogue-query")
 
     json_mode = args.output == "json"
     requested_catalogue_types = [

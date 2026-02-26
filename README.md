@@ -42,7 +42,7 @@ spydus-cli --help
 
 You can configure credentials in multiple ways:
 
-1. CLI flags: `--user`, `--password`
+1. CLI flags: `-u`, `-p` (or `--user`, `--password`)
 2. Environment variables in `.env`
 3. Interactive prompt (`--setup-creds` or automatic prompt when needed)
 
@@ -81,10 +81,10 @@ SPYDUS_CITY_PASSWORD=other_password
 uv run spydus-cli --setup-creds --save-creds
 
 # Check current loans
-uv run spydus-cli --check-loans
+uv run spydus-cli -L
 
 # Renew all overdue renewable loans
-uv run spydus-cli --renew-all
+uv run spydus-cli -R
 
 # Explicit overdue-only renewal command
 uv run spydus-cli --renew-overdue
@@ -96,45 +96,45 @@ uv run spydus-cli --renew-all-loans
 uv run spydus-cli --renew-confirm
 
 # Show account sections
-uv run spydus-cli --check-account
+uv run spydus-cli -a
 
 # Select account sections
-uv run spydus-cli --check-account --account-sections pickups,reservations,requests,history
+uv run spydus-cli -a --account-sections pickups,reservations,requests,history
 
 # Search catalogue
-uv run spydus-cli --catalogue-query "Atomic Habits" --catalogue-limit 5
+uv run spydus-cli -q "Atomic Habits" --catalogue-limit 5
 
 # Search catalogue with item-type filter
-uv run spydus-cli --catalogue-query "World War Z" --catalogue-type book,audiobook
+uv run spydus-cli -q "World War Z" -t book,audiobook
 
 # Search and switch to a specific library profile
-uv run spydus-cli --library act --catalogue-query "Atomic Habits" --catalogue-limit 5
+uv run spydus-cli -l act -q "Atomic Habits" --catalogue-limit 5
 
 # Place hold with direct hold URL
 uv run spydus-cli --place-hold-url "https://.../RSVC..."
 
 # Search catalogue — results are numbered
-uv run spydus-cli --catalogue-query "Atomic Habits"
+uv run spydus-cli -q "Atomic Habits"
 
 # Reserve result #2 from the search (searches + reserves in one step)
-uv run spydus-cli --catalogue-query "Atomic Habits" --place-hold-item-index 2
+uv run spydus-cli -q "Atomic Habits" -i 2
 
 # Reserve with a pickup branch
-uv run spydus-cli --catalogue-query "Atomic Habits" --place-hold-item-index 2 --pickup-branch "Belconnen"
+uv run spydus-cli -q "Atomic Habits" -i 2 --pickup-branch "Belconnen"
 
 # Strict machine-readable output
-uv run spydus-cli --check-loans --check-account --output json
+uv run spydus-cli -L -a -o json
 ```
 
 ## Output modes
 
-- `--output table`: readable table output
-- `--output compact`: concise one-line records with status badges
-- `--output json`: strict JSON payload on stdout for automation pipelines
+- `-o table`: readable table output
+- `-o compact`: concise one-line records with status badges
+- `-o json`: strict JSON payload on stdout for automation pipelines
 
 ## Catalogue type filters
 
-`--catalogue-type` accepts a comma-separated list of types to narrow catalogue results.
+`-t` / `--catalogue-type` accepts a comma-separated list of types to narrow catalogue results.
 
 | Type | Aliases | Spydus codes |
 |---|---|---|
@@ -149,10 +149,10 @@ Examples:
 
 ```bash
 # Single type
-uv run spydus-cli --catalogue-query "Everybody scream" --catalogue-type music
+uv run spydus-cli -q "Everybody scream" -t music
 
 # Multiple types
-uv run spydus-cli --catalogue-query "World War Z" --catalogue-type book,audiobook
+uv run spydus-cli -q "World War Z" -t book,audiobook
 ```
 
 Notes:

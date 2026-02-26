@@ -415,7 +415,7 @@ def test_main_renew_all_loans_flag():
         assert kwargs["overdue_only"] is False
 
 
-def test_main_place_hold_item_requires_selection():
+def test_main_catalogue_query_without_hold_index():
     with patch("spydus_cli.cli.SpydusClient") as mock_client_cls:
         instance = mock_client_cls.return_value
         instance.base_url = "https://example.spydus.com"
@@ -440,17 +440,17 @@ def test_main_place_hold_item_requires_selection():
 
         captured_stdout = StringIO()
         with patch("sys.stdout", new=captured_stdout):
-            with patch("sys.argv", ["prog", "--place-hold-item", "Atomic", "--output", "json"]):
+            with patch("sys.argv", ["prog", "--catalogue-query", "Atomic", "--output", "json"]):
                 main()
 
         output = captured_stdout.getvalue()
-        # --place-hold-item without --place-hold-item-index now just shows catalogue results
+        # --catalogue-query without --place-hold-item-index just shows catalogue results
         assert "catalogue" in output
         assert "Book A" in output
         instance.place_hold.assert_not_called()
 
 
-def test_main_place_hold_item_index_selection():
+def test_main_catalogue_query_with_hold_index():
     with patch("spydus_cli.cli.SpydusClient") as mock_client_cls:
         instance = mock_client_cls.return_value
         instance.base_url = "https://example.spydus.com"
@@ -483,7 +483,7 @@ def test_main_place_hold_item_index_selection():
             "sys.argv",
             [
                 "prog",
-                "--place-hold-item",
+                "--catalogue-query",
                 "Atomic",
                 "--place-hold-item-index",
                 "2",
