@@ -46,8 +46,8 @@ class SpydusClient:
         "eaudiobook": {"EAUD"},
         "audiobook": {"EAUD", "AB"},
         "dvd": {"DVD", "VD"},
-        "music-cd": {"CD", "MCD"},
-        "cd": {"CD", "MCD"},
+        "music-cd": {"CD", "MCD", "MU"},
+        "cd": {"CD", "MCD", "MU"},
     }
 
     ITEM_TYPE_ALIASES: dict[str, str] = {
@@ -269,6 +269,7 @@ class SpydusClient:
             "VD": ("dvd", "video"),
             "CD": ("music cd", "cd"),
             "MCD": ("music cd", "cd"),
+            "MU": ("music cd", "music", "cd", "audio disc"),
         }
         for code in requested_codes:
             for keyword in keyword_map.get(code, (code.lower(),)):
