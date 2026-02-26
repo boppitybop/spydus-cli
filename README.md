@@ -134,9 +134,31 @@ uv run spydus-cli --check-loans --check-account --output json
 
 ## Catalogue type filters
 
-- `--catalogue-type` accepts comma-separated aliases: `book`, `ebook`, `audiobook`, `eaudiobook`, `dvd`, `music-cd`.
-- The CLI maps these to current Spydus format codes and parameters where available, primarily `RECFMT` and `03902\\<format>` signals in OPAC results.
-- Some tenants expose mixed formats on one work record (for example `BK,EBK`), so filters include records that match any requested format.
+`--catalogue-type` accepts a comma-separated list of types to narrow catalogue results.
+
+| Type | Aliases | Spydus codes |
+|---|---|---|
+| `book` | `books` | BK |
+| `ebook` | `e-book`, `e-books` | EBK |
+| `audiobook` | `audio-book`, `audio-books` | EAUD, AB |
+| `eaudiobook` | `eaudio`, `e-audio` | EAUD |
+| `dvd` | `dvds` | DVD, VD |
+| `music-cd` | `cd`, `music`, `musiccd`, `music-cds` | CD, MCD, MU |
+
+Examples:
+
+```bash
+# Single type
+uv run spydus-cli --catalogue-query "Everybody scream" --catalogue-type music
+
+# Multiple types
+uv run spydus-cli --catalogue-query "World War Z" --catalogue-type book,audiobook
+```
+
+Notes:
+- When a single Spydus format code is resolved, it is sent as the `RECFMT` query parameter for server-side filtering.
+- When multiple codes match, results are filtered client-side by checking `RECFMT` values, `03902\\<format>` signals, and details text.
+- Some tenants expose mixed formats on one work record (e.g. `BK,EBK`), so filters include records that match **any** requested format.
 
 ## Compliance and usage notes
 

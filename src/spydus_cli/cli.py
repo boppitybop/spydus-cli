@@ -69,11 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--catalogue-query", help="Search query for catalogue")
     parser.add_argument("--catalogue-limit", type=int, default=10, help="Catalogue result limit")
+    _CATALOGUE_TYPES = ["book", "ebook", "audiobook", "eaudiobook", "dvd", "music-cd"]
     parser.add_argument(
         "--catalogue-type",
         default="",
+        metavar="TYPE",
         help=(
-            "Comma-separated item types (book, ebook, audiobook, eaudiobook, dvd, music-cd)"
+            "Comma-separated item types to filter results. "
+            f"Choices: {', '.join(_CATALOGUE_TYPES)}. "
+            "Aliases also accepted (e.g. music, cd, books, e-book)."
         ),
     )
     parser.add_argument(
