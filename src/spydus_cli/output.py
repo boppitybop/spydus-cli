@@ -8,9 +8,16 @@ def format_records_table(records: list[dict[str, Any]], columns: list[str]) -> s
     headers = columns
     rows: list[list[str]] = []
     widths = [len(header) for header in headers]
+    use_index_column = bool(columns) and columns[0] == "#"
 
     for index, record in enumerate(records, start=1):
-        values = [str(index)] + [str(record.get(column, "")) for column in columns[1:]]
+        if use_index_column:
+            # Preserve explicit row ids when present; otherwise fall back to 1-based numbering.
+            values = [str(record.get("#", index))] + [
+                str(record.get(column, "")) for column in columns[1:]
+            ]
+        else:
+            values = [str(record.get(column, "")) for column in columns]
         rows.append(values)
         for column_index, value in enumerate(values):
             widths[column_index] = max(widths[column_index], min(len(value), 48))
