@@ -97,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--place-hold-format",
+        metavar="FORMAT",
+        help=(
+            "Preferred format when reserving by index (for example BK or EBK). "
+            "Use with --place-hold-item-index."
+        ),
+    )
+    parser.add_argument(
         "--pickup-branch",
         help="Pickup branch name when submitting a reservation",
     )
@@ -136,6 +144,8 @@ def main() -> None:
         parser.error("--catalogue-limit must be >= 1")
     if args.place_hold_item_index is not None and args.place_hold_item_index < 1:
         parser.error("--place-hold-item-index must be >= 1")
+    if args.place_hold_format and args.place_hold_item_index is None:
+        parser.error("--place-hold-format requires --place-hold-item-index")
 
     if args.place_hold_item_index is not None and not args.catalogue_query:
         parser.error("--place-hold-item-index requires --catalogue-query")
@@ -154,6 +164,18 @@ def main() -> None:
         password=args.password,
         verbose=args.verbose,
     )
+
+    requested_hold_format = ""
+    if args.place_hold_format:
+        resolved_hold_codes = client.resolve_item_type_codes([args.place_hold_format])
+        if not resolved_hold_codes:
+            parser.error("--place-hold-format did not resolve to a known format")
+        if len(resolved_hold_codes) != 1:
+            parser.error(
+                "--place-hold-format resolved to multiple formats; "
+                "use a specific format code like BK or EBK"
+            )
+        requested_hold_format = next(iter(resolved_hold_codes))
 
     env_path = Path(".env")
 
@@ -352,16 +374,22 @@ def main() -> None:
             else:
                 printable_catalogue = []
                 for item in catalogue_items:
+                    reserve_count = item.get("reservation_count")
                     printable_catalogue.append(
                         {
                             **item,
                             "formats": ",".join(item.get("formats", [])),
+                            "reserves": (
+                                str(reserve_count)
+                                if isinstance(reserve_count, int)
+                                else "?"
+                            ),
                         }
                     )
                 print(
                     format_records_table(
                         printable_catalogue,
-                        ["#", "title", "details", "formats", "url"],
+                        ["#", "title", "details", "formats", "reserves", "url"],
                     )
                 )
 
@@ -397,15 +425,50 @@ def main() -> None:
                 }
             else:
                 selected_item = catalogue_items[selected_index]
-                hold_result = client.place_hold(
-                    hold_url=selected_item.get("hold_url", ""),
-                    item_url=selected_item.get("url", ""),
-                    pickup_branch=args.pickup_branch or "",
-                )
+                selected_hold_url = selected_item.get("hold_url", "")
+                hold_options = selected_item.get("hold_options") or {}
+                available_formats = sorted(hold_options.keys())
+
+                if requested_hold_format and not hold_options:
+                    # Fall back to detail-page discovery with preferred format matching.
+                    selected_hold_url = ""
+
+                if requested_hold_format and hold_options:
+                    selected_hold_url = hold_options.get(requested_hold_format, "")
+                    if not selected_hold_url:
+                        hold_result = {
+                            "success": False,
+                            "reason": (
+                                f"Format {requested_hold_format} is not available for "
+                                f"item #{args.place_hold_item_index}"
+                            ),
+                            "hold_url": "",
+                            "requested_format": requested_hold_format,
+                            "available_formats": available_formats,
+                        }
+                    else:
+                        hold_result = client.place_hold(
+                            hold_url=selected_hold_url,
+                            item_url=selected_item.get("url", ""),
+                            pickup_branch=args.pickup_branch or "",
+                            preferred_format=requested_hold_format,
+                            expected_title=selected_item.get("title", ""),
+                        )
+                else:
+                    hold_result = client.place_hold(
+                        hold_url=selected_hold_url,
+                        item_url=selected_item.get("url", ""),
+                        pickup_branch=args.pickup_branch or "",
+                        preferred_format=requested_hold_format,
+                        expected_title=selected_item.get("title", ""),
+                    )
+
                 hold_result["selected_item"] = {
                     "index": args.place_hold_item_index,
                     "title": selected_item.get("title", ""),
                     "url": selected_item.get("url", ""),
+                    "requested_format": requested_hold_format,
+                    "available_formats": available_formats,
                 }
 
         payload["data"]["hold"] = hold_result
@@ -415,6 +478,14 @@ def main() -> None:
                 print("Hold request submitted successfully.")
                 if hold_result.get("verified") is True:
                     print("Verified: reservation confirmed in your account.")
+                    queue_position = hold_result.get("queue_position")
+                    queue_size = hold_result.get("queue_size")
+                    if isinstance(queue_position, int) and isinstance(queue_size, int):
+                        print(f"Queue position: {queue_position} of {queue_size}.")
+                    elif isinstance(queue_position, int):
+                        print(f"Queue position: {queue_position}.")
+                    elif isinstance(queue_size, int):
+                        print(f"Current queue size: {queue_size}.")
                 elif hold_result.get("verified") is False:
                     print("Warning: could not verify reservation in your account. Check manually.")
             else:

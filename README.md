@@ -16,8 +16,10 @@
   - requests
   - history
 - Query whether an item appears in the catalogue
+- Show reservation queue counts in catalogue results (when exposed by the tenant)
 - Filter catalogue queries by item type (book, ebook, audiobook, dvd, music-cd)
 - Submit hold requests (direct URL or selected catalogue match)
+- After a successful hold, report your queue position when the account status exposes it
 - Output machine-ingestible JSON
 
 ## Quick start
@@ -118,6 +120,9 @@ uv run spydus-cli -q "Atomic Habits"
 
 # Reserve result #2 from the search (searches + reserves in one step)
 uv run spydus-cli -q "Atomic Habits" -i 2
+
+# Reserve the BK/EBK variant from a mixed-format result
+uv run spydus-cli -q "Carl's doomsday scenario" -i 1 --place-hold-format BK
 
 # Reserve with a pickup branch
 uv run spydus-cli -q "Atomic Habits" -i 2 --pickup-branch "Belconnen"

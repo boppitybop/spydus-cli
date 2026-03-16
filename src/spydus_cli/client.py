@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -645,11 +646,75 @@ class SpydusClient:
 
         return records
 
-    def _extract_reserve_count(self, status: str) -> int:
-        match = re.search(r"(\d+)\s+reserve", status.lower())
+    @staticmethod
+    def _extract_reservation_count(text: str) -> Optional[int]:
+        lowered = text.lower()
+        patterns = (
+            r"(\d+)\s+(?:reserve|reservation|request)s?\b",
+            r"(?:reserve|reservation|request)s?\D{0,8}(\d+)\b",
+            r"(?:queue|wait(?:ing)?\s*list)\D{0,8}(\d+)\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _extract_queue_position(text: str) -> Optional[int]:
+        lowered = text.lower()
+        patterns = (
+            r"(?:queue|waiting\s*list)\s*position\D{0,8}(\d+)\b",
+            r"(?:your\s+)?position\D{0,8}(\d+)\b",
+            r"(?:you\s+are|you're)\D{0,8}(\d+)\s*(?:st|nd|rd|th)?\s+in\s+(?:the\s+)?(?:queue|line)",
+            r"(\d+)\s*(?:st|nd|rd|th)\s+in\s+(?:the\s+)?(?:queue|line)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lowered)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _extract_rank_pair(text: str) -> tuple[Optional[int], Optional[int]]:
+        match = re.search(r"\b(\d+)\s+of\s+(\d+)\b", text.lower())
         if not match:
-            return 0
-        return int(match.group(1))
+            return None, None
+        return int(match.group(1)), int(match.group(2))
+
+    @staticmethod
+    def _normalize_title_for_match(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def _find_matching_request(
+        self,
+        requests_list: list[dict[str, Any]],
+        expected_title: str,
+    ) -> Optional[dict[str, Any]]:
+        if not expected_title:
+            return None
+
+        target = self._normalize_title_for_match(expected_title)
+        if not target:
+            return None
+
+        exact_match: Optional[dict[str, Any]] = None
+        fuzzy_match: Optional[dict[str, Any]] = None
+        for request_item in requests_list:
+            candidate = self._normalize_title_for_match(str(request_item.get("title", "")))
+            if not candidate:
+                continue
+            if candidate == target:
+                exact_match = request_item
+                break
+            if target in candidate or candidate in target:
+                fuzzy_match = fuzzy_match or request_item
+
+        return exact_match or fuzzy_match
+
+    def _extract_reserve_count(self, status: str) -> int:
+        reserve_count = self._extract_reservation_count(status)
+        return reserve_count if reserve_count is not None else 0
 
     def _parse_due_date(self, value: str) -> Optional[date]:
         cleaned = " ".join(value.split())
@@ -1040,8 +1105,8 @@ class SpydusClient:
 
         section_url = self._find_section_url(
             dashboard_soup,
-            text_keywords=("requests", "reservations"),
-            href_keywords=("/rsvcenq/",),
+            text_keywords=("reservations not yet available", "reservations"),
+            href_keywords=("qrytext=reservations", "fmt=wr"),
         )
         if not section_url:
             return []
@@ -1053,18 +1118,51 @@ class SpydusClient:
         records = self._extract_table_records(section_soup)
         reservations: list[dict[str, Any]] = []
         for record in records:
-            title = self._pick_value(record, ("details", "title", "item", "record", "col_2"))
-            status = self._pick_value(record, ("status", "state", "availability", "col_5"))
+            title = self._pick_value(
+                record,
+                (
+                    "title",
+                    "item",
+                    "record",
+                    "",
+                    "id/title",
+                    "details",
+                    "col_2",
+                    "col_1",
+                ),
+            )
+            status = self._pick_value(
+                record,
+                ("status", "state", "availability", "col_5", "col_4", "col_3"),
+            )
+            rank_text = self._pick_value(record, ("rank", "queue", "col_7", "col_6"))
             status_lower = status.lower()
-            if not include_available and (
-                "available" in status_lower or "pickup" in status_lower
-            ):
+            is_available_for_pickup = (
+                "available for pickup" in status_lower
+                or "please pickup from" in status_lower
+                or "please pick up from" in status_lower
+                or "ready for pickup" in status_lower
+                or "ready to collect" in status_lower
+            )
+            if not include_available and is_available_for_pickup:
                 continue
+
+            queue_position = self._extract_queue_position(status)
+            queue_size = self._extract_reservation_count(status)
+            if rank_text:
+                rank_position, rank_total = self._extract_rank_pair(rank_text)
+                if rank_position is not None:
+                    queue_position = rank_position
+                if rank_total is not None:
+                    queue_size = rank_total
 
             reservations.append(
                 {
                     "title": title or "Unknown title",
                     "status": status or "unknown",
+                    "rank": rank_text,
+                    "queue_position": queue_position,
+                    "queue_size": queue_size,
                     "raw": record,
                 }
             )
@@ -1072,7 +1170,44 @@ class SpydusClient:
         return reservations
 
     def get_requests(self) -> list[dict[str, Any]]:
-        return self.get_reservations(include_available=True)
+        dashboard_soup = self._load_dashboard_soup()
+        if dashboard_soup is None:
+            return []
+
+        section_url = self._find_section_url(
+            dashboard_soup,
+            text_keywords=("requests",),
+            href_keywords=("/reqenq/", "qrytext=requests"),
+        )
+        if not section_url:
+            return []
+
+        section_soup = self._fetch_soup(section_url)
+        if section_soup is None:
+            return []
+
+        records = self._extract_table_records(section_soup)
+        requests_items: list[dict[str, Any]] = []
+        for record in records:
+            title = self._pick_value(
+                record,
+                ("id/title", "title", "item", "record", "", "col_2", "col_1"),
+            )
+            status = self._pick_value(record, ("status", "state", "availability", "col_6", "col_5"))
+            queue_position = self._extract_queue_position(status)
+            queue_size = self._extract_reservation_count(status)
+
+            requests_items.append(
+                {
+                    "title": title or "Unknown title",
+                    "status": status or "unknown",
+                    "queue_position": queue_position,
+                    "queue_size": queue_size,
+                    "raw": record,
+                }
+            )
+
+        return requests_items
 
     def get_history(self) -> list[dict[str, Any]]:
         dashboard_soup = self._load_dashboard_soup()
@@ -1205,8 +1340,13 @@ class SpydusClient:
                 details_text = ""
                 hold_url = ""
                 format_codes: set[str] = set()
+                hold_options: dict[str, str] = {}
+                reservation_count: Optional[int] = None
 
                 if container:
+                    container_text = self._clean_text(container.get_text(" ", strip=True))
+                    reservation_count = self._extract_reservation_count(container_text)
+
                     details_el = container.select_one(".card-text.recdetails, .recdetails")
                     if details_el:
                         details_text = self._normalize_details_text(details_el)
@@ -1230,8 +1370,18 @@ class SpydusClient:
                             or "request" in anchor_text
                             or bool(re.search(r"ccopt/\d", anchor_href))
                         ) and "xsvl" not in anchor_href and "rsvcenq" not in anchor_href:
-                            hold_url = urljoin(self.base_url, anchor_href_raw)
-                            break
+                            resolved_href = urljoin(self.base_url, anchor_href_raw)
+                            href_format_codes = self._extract_format_codes_from_text(
+                                anchor_href_raw
+                            )
+                            if href_format_codes:
+                                for code in href_format_codes:
+                                    hold_options.setdefault(code, resolved_href)
+                            if not hold_url:
+                                hold_url = resolved_href
+
+                if not hold_url and hold_options:
+                    hold_url = hold_options.get(sorted(hold_options.keys())[0], "")
 
                 if not self._matches_item_type_filter(
                     details_text=details_text,
@@ -1247,6 +1397,8 @@ class SpydusClient:
                         "url": full_url,
                         "hold_url": hold_url,
                         "formats": sorted(format_codes),
+                        "hold_options": hold_options,
+                        "reservation_count": reservation_count,
                     }
                 )
 
@@ -1273,6 +1425,8 @@ class SpydusClient:
                         "url": href,
                         "hold_url": "",
                         "formats": [],
+                        "hold_options": {},
+                        "reservation_count": None,
                     }
                 )
 
@@ -1292,7 +1446,7 @@ class SpydusClient:
 
         return []
 
-    def discover_hold_url(self, item_url: str) -> str:
+    def discover_hold_url(self, item_url: str, preferred_format: str = "") -> str:
         if not item_url:
             return ""
         if not self._ensure_base_url():
@@ -1308,10 +1462,13 @@ class SpydusClient:
         # The href alone is unreliable — many CCOPT URLs are non-reservation
         # (e.g., CCOPT/LB = branch, CCOPT/.../RQF = cancel membership, RSVCENQ = enquiry).
         NEGATIVE_TEXT = {"cancel", "logout", "dashboard", "membership", "login", "sign"}
+        normalized_preferred_format = preferred_format.strip().upper()
         candidate_by_text: str | None = None
+        coded_candidates: list[tuple[str, set[str]]] = []
         for anchor in soup.find_all("a", href=True):
             text = anchor.get_text(" ", strip=True).lower()
             href = anchor["href"].lower()
+            href_codes = self._extract_format_codes_from_text(anchor["href"])
 
             # Skip links with clearly non-reservation text
             if any(w in text for w in NEGATIVE_TEXT):
@@ -1326,11 +1483,31 @@ class SpydusClient:
                 or "hold" in text
             )
             if has_reservation_href and has_reservation_text:
+                if href_codes:
+                    coded_candidates.append((urljoin(self.base_url, anchor["href"]), href_codes))
+                    if normalized_preferred_format and normalized_preferred_format in href_codes:
+                        self._log(
+                            "discover_hold_url: preferred format match "
+                            f"({normalized_preferred_format}) -> {anchor['href']}"
+                        )
+                        return urljoin(self.base_url, anchor["href"])
+                if normalized_preferred_format:
+                    continue
                 self._log(f"discover_hold_url: href+text match -> {anchor['href']}")
                 return urljoin(self.base_url, anchor["href"])
 
             # Also accept CCOPT URLs containing /R/ and SVL= (reservation URL structure)
             if has_reservation_href and "/r/" in href and "svl=" in href:
+                if href_codes:
+                    coded_candidates.append((urljoin(self.base_url, anchor["href"]), href_codes))
+                    if normalized_preferred_format and normalized_preferred_format in href_codes:
+                        self._log(
+                            "discover_hold_url: preferred reservation URL pattern "
+                            f"({normalized_preferred_format}) -> {anchor['href']}"
+                        )
+                        return urljoin(self.base_url, anchor["href"])
+                if normalized_preferred_format:
+                    continue
                 self._log(f"discover_hold_url: reservation URL pattern -> {anchor['href']}")
                 return urljoin(self.base_url, anchor["href"])
 
@@ -1341,6 +1518,11 @@ class SpydusClient:
             ):
                 candidate_by_text = urljoin(self.base_url, anchor["href"])
                 self._log(f"discover_hold_url: text candidate -> {candidate_by_text}")
+
+        if normalized_preferred_format:
+            for candidate_url, candidate_codes in coded_candidates:
+                if normalized_preferred_format in candidate_codes:
+                    return candidate_url
 
         if candidate_by_text:
             return candidate_by_text
@@ -1408,6 +1590,8 @@ class SpydusClient:
         hold_url: str = "",
         item_url: str = "",
         pickup_branch: str = "",
+        preferred_format: str = "",
+        expected_title: str = "",
     ) -> dict[str, Any]:
         if not self._ensure_base_url():
             return {
@@ -1420,12 +1604,28 @@ class SpydusClient:
         if hold_url and "xsvl" in hold_url.lower():
             self._log(f"Ignoring XSVL hold_url: {hold_url}")
             hold_url = ""
-        resolved_hold_url = hold_url or self.discover_hold_url(item_url)
+
+        baseline_request_count: Optional[int] = None
+        try:
+            baseline_reservations = self.get_reservations(include_available=False)
+            baseline_requests = self.get_requests()
+            baseline_request_count = len(baseline_reservations) + len(baseline_requests)
+        except Exception:
+            baseline_request_count = None
+
+        resolved_hold_url = hold_url or self.discover_hold_url(
+            item_url,
+            preferred_format=preferred_format,
+        )
         self._log(f"Resolved hold URL: {resolved_hold_url}")
         if not resolved_hold_url:
+            if preferred_format:
+                reason = f"No hold URL found for requested format {preferred_format}"
+            else:
+                reason = "No hold URL found for this item"
             return {
                 "success": False,
-                "reason": "No hold URL found for this item",
+                "reason": reason,
                 "hold_url": "",
             }
 
@@ -1539,8 +1739,11 @@ class SpydusClient:
         has_success = any(pattern in body for pattern in success_patterns)
         self._log(f"Hold result: has_success={has_success}  has_failure={has_failure}  form={'yes' if form else 'no'}")
 
-        # Trust explicit success markers over generic failure keywords
+        # Trust explicit success markers over generic failure keywords. A form
+        # submit with no explicit marker is treated as provisional success and
+        # must be confirmed by dashboard/confirmation-page verification below.
         succeeded = has_success or (not has_failure and form is not None)
+        provisional_success = not has_success and not has_failure and form is not None
 
         reason = ""
         if not succeeded:
@@ -1563,25 +1766,126 @@ class SpydusClient:
             "pickup_branch": pickup_value,
         }
 
+        confirmation_text = self._clean_text(
+            BeautifulSoup(final_response.text, "html.parser").get_text(" ", strip=True)
+        )
+        confirmation_queue_position = self._extract_queue_position(confirmation_text)
+        confirmation_queue_size = self._extract_reservation_count(confirmation_text)
+
         # Verify by checking reservations if the submission appeared to succeed
         if succeeded:
-            verified = self._verify_hold_in_reservations(item_url)
-            result["verified"] = verified
-            if not verified:
+            verification = self._verify_hold_in_reservations(
+                item_url=item_url,
+                expected_title=expected_title,
+                baseline_request_count=baseline_request_count,
+                attempts=3,
+                retry_delay_seconds=1.0,
+            )
+
+            if not verification.get("verified") and (
+                confirmation_queue_position is not None or confirmation_queue_size is not None
+            ):
+                verification["verified"] = True
+                verification["queue_position"] = (
+                    confirmation_queue_position
+                    if verification.get("queue_position") is None
+                    else verification.get("queue_position")
+                )
+                verification["queue_size"] = (
+                    confirmation_queue_size
+                    if verification.get("queue_size") is None
+                    else verification.get("queue_size")
+                )
+                if not verification.get("matched_title"):
+                    verification["matched_title"] = expected_title
+                verification["verification_source"] = "confirmation_page"
+
+            if provisional_success and not verification.get("verified"):
+                succeeded = False
+                if not reason:
+                    reason = (
+                        "Hold submission could not be verified in your account; "
+                        "please retry or check manually."
+                    )
+                result["success"] = False
+                result["reason"] = reason
+
+            result.update(verification)
+            if not verification.get("verified"):
                 self._log("Warning: hold submission response looked successful but item not found in reservations")
 
         return result
 
-    def _verify_hold_in_reservations(self, item_url: str) -> bool:
-        """Check whether a recently placed hold appears in the reservations/requests section."""
-        try:
-            requests_list = self.get_requests()
-            if not requests_list:
-                return False
-            # Try to match by title substring from the item URL or by checking request count changed
-            return len(requests_list) > 0
-        except Exception:
-            return False
+    def _verify_hold_in_reservations(
+        self,
+        item_url: str,
+        expected_title: str = "",
+        baseline_request_count: Optional[int] = None,
+        attempts: int = 1,
+        retry_delay_seconds: float = 0.0,
+    ) -> dict[str, Any]:
+        """Check whether a recently placed hold appears in requests and extract queue details."""
+        _ = item_url
+        safe_attempts = max(1, attempts)
+        for attempt in range(safe_attempts):
+            try:
+                reservations_list = self.get_reservations(include_available=False)
+            except Exception:
+                reservations_list = []
+
+            try:
+                requests_list = self.get_requests()
+            except Exception:
+                requests_list = []
+
+            queue_items = reservations_list + requests_list
+
+            if not queue_items:
+                if attempt < safe_attempts - 1 and retry_delay_seconds > 0:
+                    time.sleep(retry_delay_seconds)
+                continue
+
+            matched_request: Optional[dict[str, Any]] = None
+            if expected_title:
+                matched_request = self._find_matching_request(queue_items, expected_title)
+
+            if matched_request is not None:
+                status_text = str(matched_request.get("status", ""))
+                queue_position = matched_request.get("queue_position")
+                queue_size = matched_request.get("queue_size")
+                if queue_position is None:
+                    queue_position = self._extract_queue_position(status_text)
+                if queue_size is None:
+                    queue_size = self._extract_reservation_count(status_text)
+                return {
+                    "verified": True,
+                    "queue_position": queue_position,
+                    "queue_size": queue_size,
+                    "matched_title": matched_request.get("title", ""),
+                    "verification_source": "dashboard_queue_title_match",
+                }
+
+            if baseline_request_count is not None and len(queue_items) > baseline_request_count:
+                latest_request = queue_items[0]
+                status_text = str(latest_request.get("status", ""))
+                return {
+                    "verified": True,
+                    "queue_position": self._extract_queue_position(status_text),
+                    "queue_size": self._extract_reservation_count(status_text),
+                    "matched_title": latest_request.get("title", ""),
+                    "verification_source": "dashboard_count_change",
+                }
+
+            if attempt < safe_attempts - 1 and retry_delay_seconds > 0:
+                time.sleep(retry_delay_seconds)
+
+        return {
+            "verified": False,
+            "queue_position": None,
+            "queue_size": None,
+            "matched_title": "",
+            "verification_source": "",
+        }
 
     def save_credentials(self, env_path: Path) -> None:
         env_values: dict[str, str] = {}

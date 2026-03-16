@@ -192,8 +192,12 @@ def test_query_catalogue_parsing(mock_session):
                         </a>
                     </h3>
                     <div class="card-text recdetails"><span>Clear, James</span><span>2018</span></div>
+                    <p>5 reservations currently queued</p>
                     <a href="/cgi-bin/spydus.exe/PGM/OPAC/CCOPT/123/0/V/0/R/9/ALLWRKENQ?SVL=456&amp;RECFMT=BK">
                         Place reservation
+                    </a>
+                    <a href="/cgi-bin/spydus.exe/PGM/OPAC/CCOPT/123/0/V/0/R/9/ALLWRKENQ?SVL=456&amp;RECFMT=EBK">
+                        Place reservation (ebook)
                     </a>
                 </div>
             </fieldset>
@@ -217,7 +221,10 @@ def test_query_catalogue_parsing(mock_session):
     assert items[0]["details"] == "Clear, James • 2018"
     assert "/FULL/OPAC/ALLWRKENQ/123/456,1" in items[0]["url"]
     assert "/PGM/OPAC/CCOPT/123/0/V/0/R/9/ALLWRKENQ" in items[0]["hold_url"]
-    assert items[0]["formats"] == ["BK"]
+    assert items[0]["formats"] == ["BK", "EBK"]
+    assert items[0]["hold_options"]["BK"].endswith("RECFMT=BK")
+    assert items[0]["hold_options"]["EBK"].endswith("RECFMT=EBK")
+    assert items[0]["reservation_count"] == 5
 
     called_url = mock_session.get.call_args[0][0]
     assert "/ENQ/OPAC/ALLWRKENQ" in called_url
@@ -251,6 +258,199 @@ def test_query_catalogue_item_type_filter(mock_session):
         assert dvd_items == []
         assert len(book_items) == 1
         assert book_items[0]["formats"] == ["BK"]
+
+
+def test_get_reservations_includes_queue_details(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(client, "_load_dashboard_soup", return_value=MagicMock()):
+        with patch.object(client, "_find_section_url", return_value="https://example/req"):
+            with patch.object(client, "_fetch_soup", return_value=MagicMock()):
+                with patch.object(
+                    client,
+                    "_extract_table_records",
+                    return_value=[
+                        {
+                            "details": "Carl's doomsday scenario",
+                            "status": "Position 3 in queue, 12 reservations",
+                        }
+                    ],
+                ):
+                    reservations = client.get_reservations(include_available=True)
+
+    assert len(reservations) == 1
+    assert reservations[0]["queue_position"] == 3
+    assert reservations[0]["queue_size"] == 12
+
+
+def test_get_reservations_column_fallbacks(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(client, "_load_dashboard_soup", return_value=MagicMock()):
+        with patch.object(client, "_find_section_url", return_value="https://example/req"):
+            with patch.object(client, "_fetch_soup", return_value=MagicMock()):
+                with patch.object(
+                    client,
+                    "_extract_table_records",
+                    return_value=[
+                        {
+                            "col_1": "Carl's doomsday scenario",
+                            "col_3": "Queue position 5, 21 reservations",
+                        }
+                    ],
+                ):
+                    reservations = client.get_reservations(include_available=True)
+
+    assert len(reservations) == 1
+    assert reservations[0]["title"] == "Carl's doomsday scenario"
+    assert reservations[0]["queue_position"] == 5
+    assert reservations[0]["queue_size"] == 21
+
+
+def test_get_reservations_rank_column_parsed(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(client, "_load_dashboard_soup", return_value=MagicMock()):
+        with patch.object(client, "_find_section_url", return_value="https://example/rsvc"):
+            with patch.object(client, "_fetch_soup", return_value=MagicMock()):
+                with patch.object(
+                    client,
+                    "_extract_table_records",
+                    return_value=[
+                        {
+                            "": "Wild swans : three daughters of China",
+                            "rank": "1 of 3",
+                            "status": "Requested pickup location: Gungahlin Branch",
+                        }
+                    ],
+                ):
+                    reservations = client.get_reservations(include_available=True)
+
+    assert len(reservations) == 1
+    assert reservations[0]["title"].startswith("Wild swans")
+    assert reservations[0]["rank"] == "1 of 3"
+    assert reservations[0]["queue_position"] == 1
+    assert reservations[0]["queue_size"] == 3
+
+
+def test_get_requests_uses_requests_section(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(client, "_load_dashboard_soup", return_value=MagicMock()):
+        with patch.object(client, "_find_section_url", return_value="https://example/req") as find_url:
+            with patch.object(client, "_fetch_soup", return_value=MagicMock()):
+                with patch.object(
+                    client,
+                    "_extract_table_records",
+                    return_value=[
+                        {
+                            "id/title": "RQ29751 Rurouni Kenshin",
+                            "status": "Pending review Pickup: ACT Heritage Library",
+                        }
+                    ],
+                ):
+                    requests_items = client.get_requests()
+
+    assert len(requests_items) == 1
+    assert requests_items[0]["title"].startswith("RQ29751")
+    _, kwargs = find_url.call_args
+    assert "/reqenq/" in kwargs["href_keywords"]
+
+
+def test_verify_hold_in_reservations_matches_title(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(
+        client,
+        "get_requests",
+        return_value=[
+            {
+                "title": "Carl's doomsday scenario",
+                "status": "Position 4 in queue with 9 reservations",
+                "queue_position": 4,
+                "queue_size": 9,
+            }
+        ],
+    ):
+        verification = client._verify_hold_in_reservations(
+            item_url="",
+            expected_title="Carls Doomsday Scenario",
+            baseline_request_count=0,
+        )
+
+    assert verification["verified"] is True
+    assert verification["queue_position"] == 4
+    assert verification["queue_size"] == 9
+
+
+def test_verify_hold_in_reservations_retries_then_matches(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    with patch.object(
+        client,
+        "get_requests",
+        side_effect=[
+            [],
+            [
+                {
+                    "title": "Carl's doomsday scenario",
+                    "status": "Position 2 in queue, 13 reservations",
+                }
+            ],
+        ],
+    ):
+        verification = client._verify_hold_in_reservations(
+            item_url="",
+            expected_title="Carls doomsday scenario",
+            attempts=2,
+            retry_delay_seconds=0.0,
+        )
+
+    assert verification["verified"] is True
+    assert verification["queue_position"] == 2
+    assert verification["queue_size"] == 13
+
+
+def test_place_hold_unverified_provisional_submit_marks_failure(mock_session):
+    client = SpydusClient(base_url="https://example.spydus.com", session=mock_session)
+
+    hold_page = MagicMock()
+    hold_page.status_code = 200
+    hold_page.text = (
+        "<html><body>"
+        '<form method="post" action="/submit">'
+        '<input type="hidden" name="token" value="abc"/>'
+        '<input type="submit" name="continue" value="Continue"/>'
+        "</form>"
+        "</body></html>"
+    )
+
+    submit_page = MagicMock()
+    submit_page.status_code = 200
+    submit_page.text = "<html><body><p>Request processed.</p></body></html>"
+
+    mock_session.get.return_value = hold_page
+    mock_session.post.return_value = submit_page
+
+    with patch.object(client, "get_requests", return_value=[]):
+        with patch.object(
+            client,
+            "_verify_hold_in_reservations",
+            return_value={
+                "verified": False,
+                "queue_position": None,
+                "queue_size": None,
+                "matched_title": "",
+                "verification_source": "",
+            },
+        ):
+            result = client.place_hold(
+                hold_url="https://example.spydus.com/hold",
+                item_url="https://example.spydus.com/item",
+            )
+
+    assert result["success"] is False
+    assert "could not be verified" in result["reason"].lower()
 
 
 def test_profile_env_resolution(mock_session):
@@ -497,4 +697,139 @@ def test_main_catalogue_query_with_hold_index():
             hold_url="https://example/hold/b",
             item_url="https://example/item/b",
             pickup_branch="",
+            preferred_format="",
+            expected_title="Book B",
         )
+
+
+def test_main_catalogue_query_with_hold_index_and_format():
+    with patch("spydus_cli.cli.SpydusClient") as mock_client_cls:
+        instance = mock_client_cls.return_value
+        instance.base_url = "https://example.spydus.com"
+        instance.profile_key = "default"
+        instance.login.return_value = True
+        instance.resolve_item_type_codes.return_value = {"EBK"}
+        instance.query_catalogue.return_value = [
+            {
+                "title": "Book A",
+                "details": "Author A • 2021",
+                "url": "https://example/item/a",
+                "hold_url": "https://example/hold/a?RECFMT=BK",
+                "formats": ["BK", "EBK"],
+                "hold_options": {
+                    "BK": "https://example/hold/a?RECFMT=BK",
+                    "EBK": "https://example/hold/a?RECFMT=EBK",
+                },
+            }
+        ]
+        instance.place_hold.return_value = {
+            "success": True,
+            "reason": "",
+            "hold_url": "https://example/hold/a?RECFMT=EBK",
+            "pickup_branch": "",
+        }
+
+        with patch(
+            "sys.argv",
+            [
+                "prog",
+                "--catalogue-query",
+                "Atomic",
+                "--place-hold-item-index",
+                "1",
+                "--place-hold-format",
+                "ebook",
+                "--output",
+                "json",
+            ],
+        ):
+            main()
+
+        instance.place_hold.assert_called_once_with(
+            hold_url="https://example/hold/a?RECFMT=EBK",
+            item_url="https://example/item/a",
+            pickup_branch="",
+            preferred_format="EBK",
+            expected_title="Book A",
+        )
+
+
+def test_main_catalogue_query_with_hold_index_unavailable_format():
+    with patch("spydus_cli.cli.SpydusClient") as mock_client_cls:
+        instance = mock_client_cls.return_value
+        instance.base_url = "https://example.spydus.com"
+        instance.profile_key = "default"
+        instance.login.return_value = True
+        instance.resolve_item_type_codes.return_value = {"EBK"}
+        instance.query_catalogue.return_value = [
+            {
+                "title": "Book A",
+                "details": "Author A • 2021",
+                "url": "https://example/item/a",
+                "hold_url": "https://example/hold/a?RECFMT=BK",
+                "formats": ["BK"],
+                "hold_options": {
+                    "BK": "https://example/hold/a?RECFMT=BK",
+                },
+            }
+        ]
+
+        captured_stdout = StringIO()
+        with patch("sys.stdout", new=captured_stdout):
+            with patch(
+                "sys.argv",
+                [
+                    "prog",
+                    "--catalogue-query",
+                    "Atomic",
+                    "--place-hold-item-index",
+                    "1",
+                    "--place-hold-format",
+                    "ebook",
+                    "--output",
+                    "json",
+                ],
+            ):
+                main()
+
+        instance.place_hold.assert_not_called()
+        output = captured_stdout.getvalue()
+        assert "Format EBK is not available" in output
+        assert '"available_formats": [' in output
+
+
+def test_main_hold_request_prints_queue_position():
+    with patch("spydus_cli.cli.SpydusClient") as mock_client_cls:
+        instance = mock_client_cls.return_value
+        instance.base_url = "https://example.spydus.com"
+        instance.profile_key = "default"
+        instance.username = "card"
+        instance.password = "pw"
+        instance.login.return_value = True
+        instance.place_hold.return_value = {
+            "success": True,
+            "reason": "",
+            "hold_url": "https://example/hold/a",
+            "pickup_branch": "",
+            "verified": True,
+            "queue_position": 4,
+            "queue_size": 17,
+        }
+
+        captured_stdout = StringIO()
+        with patch("sys.stdout", new=captured_stdout):
+            with patch(
+                "sys.argv",
+                [
+                    "prog",
+                    "--place-hold-url",
+                    "https://example/hold/a",
+                    "--output",
+                    "table",
+                ],
+            ):
+                main()
+
+        output = captured_stdout.getvalue()
+        assert "Hold request submitted successfully." in output
+        assert "Queue position: 4 of 17." in output
