@@ -389,7 +389,7 @@ def main() -> None:
                 print(
                     format_records_table(
                         printable_catalogue,
-                        ["#", "title", "details", "formats", "reserves", "url"],
+                        ["#", "title", "details", "formats", "reserves"],
                     )
                 )
 
